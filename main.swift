@@ -22,17 +22,25 @@ let validKinds: Set<String> = ["done", "input", "warn", "alert", "clear"]
 
 // MARK: - Helpers
 
-func runCapture(_ path: String, _ args: [String], timeout: Double = 1.5) -> String? {
+func debugLog(_ msg: String) {
+    let path = NSString(string: "~/Library/Logs/EdgeGlow.log").expandingTildeInPath
+    let line = "\(Date()) \(msg)\n"
+    if let h = FileHandle(forWritingAtPath: path) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
+    else { FileManager.default.createFile(atPath: path, contents: Data(line.utf8)) }
+}
+
+func runCapture(_ path: String, _ args: [String], timeout: Double = 1.5, extraEnv: [String: String] = [:]) -> String? {
     guard FileManager.default.isExecutableFile(atPath: path) else { return nil }
     let p = Process()
     p.executableURL = URL(fileURLWithPath: path)
     p.arguments = args
     var env = ProcessInfo.processInfo.environment
     env["CMUX_QUIET"] = "1"
+    env.merge(extraEnv) { _, new in new }
     p.environment = env
     let out = Pipe()
     p.standardOutput = out
-    p.standardError = FileHandle.nullDevice
+    p.standardError = out
     do { try p.run() } catch { return nil }
     let deadline = Date().addingTimeInterval(timeout)
     while p.isRunning && Date() < deadline { usleep(10_000) }
@@ -206,9 +214,13 @@ if let cmd = cliArgs.first, validKinds.contains(cmd) || cmd == "hook" {
     }
 
     let env = ProcessInfo.processInfo.environment
+    if info["kind"] != "clear", let app = env["__CFBundleIdentifier"] { info["app"] = app }
     if info["kind"] != "clear", let ws = env["CMUX_WORKSPACE_ID"] {
         info["workspace"] = ws
         if let s = env["CMUX_SURFACE_ID"] { info["surface"] = s }
+        // cmux only accepts commands from processes it started. EdgeGlow runs outside cmux, so it
+        // borrows the access token this hook inherited from its pane to switch tabs on click.
+        if let cap = env["CMUX_SOCKET_CAPABILITY"] { info["cmuxToken"] = cap }
         if let t = cmuxWorkspaceTitle(ws) { info["place"] = t }
     }
     DistributedNotificationCenter.default().postNotificationName(
@@ -247,7 +259,7 @@ enum Kind: String {
     }
     var lifetime: Double {
         switch self {
-        case .done: return 6
+        case .done: return 10
         case .input: return 15 * 60
         case .warn: return 3 * 60
         case .alert: return 60 * 60
@@ -263,6 +275,8 @@ struct Item: Identifiable {
     let subtitle: String
     let workspace: String?
     let surface: String?
+    let app: String?          // bundle id of the terminal/app the agent runs in
+    let cmuxToken: String?
     let created = Date()
     let expires: Date
 }
@@ -441,6 +455,10 @@ struct IslandView: View {
 
 // MARK: - App
 
+final class FirstClickHostingView<V: View>: NSHostingView<V> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 final class OverlayWindow: NSWindow {
     init(frame: NSRect) {
         super.init(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
@@ -488,7 +506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             let iw: CGFloat = 480, ih: CGFloat = 160
             let island = OverlayWindow(frame: NSRect(x: f.midX - iw / 2, y: f.maxY - ih, width: iw, height: ih))
-            island.contentView = NSHostingView(rootView: IslandView(s: state, notch: notch) { [weak self] in self?.tapped() })
+            island.contentView = FirstClickHostingView(rootView: IslandView(s: state, notch: notch) { [weak self] in self?.tapped() })
             island.orderFrontRegardless()
             islandWindows.append(island)
         }
@@ -515,7 +533,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         state.items.removeAll { $0.key == key }
         state.items.append(Item(key: key, kind: kind, title: title, subtitle: subtitle,
-                                workspace: info["workspace"], surface: info["surface"],
+                                workspace: info["workspace"], surface: info["surface"], app: info["app"], cmuxToken: info["cmuxToken"],
                                 expires: Date().addingTimeInterval(kind.lifetime)))
         expand()
     }
@@ -531,20 +549,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func tapped() {
         guard let top = state.top else { return }
-        if !state.expanded { expand(); return }
         state.items.removeAll { $0.id == top.id }
-        if let ws = top.workspace { focus(workspace: ws, surface: top.surface) }
+        focus(top)
         if state.items.isEmpty { state.expanded = false } else { expand() }
         afterChange()
     }
 
-    func focus(workspace: String, surface: String?) {
+    func focus(_ item: Item) {
         DispatchQueue.global().async {
-            _ = runCapture(cmuxBin, ["select-workspace", "--workspace", workspace])
-            if let s = surface { _ = runCapture(cmuxBin, ["focus-panel", "--panel", s, "--workspace", workspace]) }
-            DispatchQueue.main.async {
-                NSRunningApplication.runningApplications(withBundleIdentifier: "com.cmuxterm.app").first?.activate()
+            var bundle = item.app
+            if let ws = item.workspace {
+                let env = item.cmuxToken.map { ["CMUX_SOCKET_CAPABILITY": $0] } ?? [:]
+                let out = runCapture(cmuxBin, ["select-workspace", "--workspace", ws], extraEnv: env) ?? "failed to run cmux"
+                if !out.hasPrefix("OK") { debugLog("cmux select-workspace: \(out.trimmingCharacters(in: .whitespacesAndNewlines))") }
+                if let s = item.surface {
+                    _ = runCapture(cmuxBin, ["focus-panel", "--panel", s, "--workspace", ws], extraEnv: env)
+                }
+                bundle = "com.cmuxterm.app"
             }
+            if let bundle { _ = runCapture("/usr/bin/open", ["-b", bundle]) }
         }
     }
 
