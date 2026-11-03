@@ -38,7 +38,7 @@ To remove everything: `./uninstall.sh`
 
 - **Queue.** Several sessions can alert at once. The most urgent one is shown (red > blue > amber > green) with a `+N` badge for the rest.
 - **Compact mode.** After about 7 seconds the pill shrinks to a small indicator and blue/amber glows dim to a gentle pulse, so a pending question doesn't keep flashing at you.
-- **Click the pill** to dismiss the current alert. If you use the cmux terminal, clicking also jumps straight to the workspace and pane the alert came from, and the pill shows the workspace name.
+- **Click the pill** to jump to where the alert came from and dismiss it. In the cmux terminal it switches to the exact workspace and pane, and the pill shows the workspace name. cmux only accepts commands from processes it started, so the hook passes along its pane's access token. In other terminals it brings that app to the front. On a notched screen, click beside the notch: the notch itself can't receive clicks.
 - **Per session.** Replying in one session only clears that session's alert.
 - **Notch aware.** On MacBooks with a notch, the pill grows out of the notch. On other displays it floats just below the top edge. Every connected screen glows.
 
