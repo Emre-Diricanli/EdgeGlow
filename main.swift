@@ -1,15 +1,17 @@
-// EdgeGlow: screen-edge glow + Dynamic Island style pill for notifications.
+// EdgeGlow: screen-edge glow + Dynamic Island style pill for AI coding agents.
 //
+//   edgeglow hook <agent>               read an agent's hook JSON on stdin and react
+//                                       agents: claude codex gemini qwen kimi grok
 //   edgeglow done  [title] [subtitle]   green  - task finished
 //   edgeglow input [title] [subtitle]   blue   - needs your input
 //   edgeglow warn  [title] [subtitle]   amber  - warning
 //   edgeglow alert [title] [subtitle]   red    - critical, stays until clicked
 //   edgeglow clear                      dismiss everything
-//   --hook   read Claude Code hook JSON from stdin (session, cwd, message, summary)
-//   --id X   dedupe key: a new event with the same id replaces the old one; `clear --id X` removes it
+//   --id X        dedupe key: same id replaces the old alert; `clear --id X` removes just that one
+//   --agent X     agent name shown in the pill (e.g. opencode)
+//   --project X   project name shown in the pill
 //
-// Only local processes (Claude Code hooks / your terminal) can trigger it; no network listener.
-//
+// Only local processes can trigger it; there is no network listener.
 // Run with no arguments to start the overlay app.
 import Cocoa
 import SwiftUI
@@ -76,45 +78,135 @@ func cmuxWorkspaceTitle(_ uuid: String) -> String? {
     return nil
 }
 
+// MARK: - Agent adapters
+
+let agentNames = ["claude": "Claude", "codex": "Codex", "gemini": "Gemini", "qwen": "Qwen",
+                  "kimi": "Kimi", "grok": "Grok", "opencode": "OpenCode"]
+
+/// "UserPromptSubmit", "user_prompt_submit" -> "userpromptsubmit"
+func norm(_ s: String?) -> String { (s ?? "").lowercased().replacingOccurrences(of: "_", with: "") }
+
+func str(_ j: [String: Any], _ keys: String...) -> String? {
+    for k in keys { if let v = j[k] as? String, !v.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return v } }
+    return nil
+}
+
+/// Turns one agent's hook payload into (kind, subtitle). nil = ignore this event.
+func adapt(_ agent: String, _ j: [String: Any]) -> (kind: String, subtitle: String?)? {
+    let event = norm(str(j, "hook_event_name", "hookEventName"))
+    let ntype = norm(str(j, "notification_type", "notificationType"))
+    let message = str(j, "message")
+    let summary = str(j, "last_assistant_message", "lastAssistantMessage", "prompt_response").map { oneLine($0) }
+    let tool = j["tool_input"] as? [String: Any] ?? [:]
+    let snake = j["hook_event_name"] is String && j["hookEventName"] == nil
+
+    switch agent {
+    case "claude":
+        // Grok and Kimi can end up calling Claude's hooks; only accept Claude's own payload shape.
+        guard snake, j["client_type"] == nil else { return nil }
+        switch event {
+        case "stop":
+            return ("done", summary ?? str(j, "transcript_path").flatMap(lastAssistantText).map { oneLine($0) })
+        case "notification":
+            // skip the "still waiting" nudge after a finished turn, and auth/info notices
+            guard ["", "permissionprompt", "elicitationdialog"].contains(ntype),
+                  !(message ?? "").lowercased().contains("waiting for your input") else { return nil }
+            return ("input", message)
+        case "userpromptsubmit", "posttooluse": return ("clear", nil)
+        default: return nil
+        }
+    case "qwen":
+        guard snake else { return nil }
+        switch event {
+        case "stop": return ("done", summary)
+        case "notification": return ntype == "permissionprompt" ? ("input", message) : nil
+        case "userpromptsubmit", "posttooluse": return ("clear", nil)
+        default: return nil
+        }
+    case "gemini":
+        guard snake else { return nil }
+        switch event {
+        case "afteragent": return ("done", summary)
+        case "notification": return ("input", message)
+        case "beforeagent", "aftertool": return ("clear", nil)
+        default: return nil
+        }
+    case "codex":
+        guard snake else { return nil }
+        switch event {
+        case "stop": return ("done", summary)
+        case "permissionrequest":
+            return ("input", (tool["description"] as? String) ?? (tool["command"] as? String).map { "Run: \($0)" } ?? "Approval needed")
+        case "userpromptsubmit", "posttooluse", "interrupt", "sessionend": return ("clear", nil)
+        default: return nil
+        }
+    case "kimi":
+        guard snake else { return nil }
+        switch event {
+        case "stop": return ("done", nil)
+        case "permissionrequest": return ("input", str(j, "action") ?? str(j, "tool_name").map { "Approve \($0)" })
+        case "pretooluse":
+            guard str(j, "tool_name") == "AskUserQuestion" else { return nil }
+            let q = (tool["questions"] as? [[String: Any]])?.first?["question"] as? String
+            return ("input", q ?? "Kimi has a question")
+        case "userpromptsubmit", "posttooluse": return ("clear", nil)
+        default: return nil
+        }
+    case "grok":
+        guard j["hookEventName"] != nil else { return nil }
+        switch event {
+        case "stop": return norm(str(j, "reason")) == "endturn" ? ("done", summary) : nil
+        case "notification":
+            return ["permissionprompt", "elicitationdialog"].contains(ntype) ? ("input", message) : nil
+        case "userpromptsubmit", "posttooluse": return ("clear", nil)
+        default: return nil
+        }
+    default:
+        return nil
+    }
+}
+
 // MARK: - CLI mode
 
 let cliArgs = Array(CommandLine.arguments.dropFirst())
-if let cmd = cliArgs.first, validKinds.contains(cmd) {
-    var info: [String: String] = ["kind": cmd]
+if let cmd = cliArgs.first, validKinds.contains(cmd) || cmd == "hook" {
+    var info: [String: String] = [:]
     var positional: [String] = []
     var i = 1
     while i < cliArgs.count {
         let a = cliArgs[i]
-        if a == "--id", i + 1 < cliArgs.count { info["id"] = cliArgs[i + 1]; i += 2; continue }
-        if a != "--hook" { positional.append(a) }
+        let next = i + 1 < cliArgs.count ? cliArgs[i + 1] : nil
+        switch a {
+        case "--id": info["id"] = next; i += 2; continue
+        case "--agent": info["agent"] = next.map { agentNames[$0.lowercased()] ?? $0 }; i += 2; continue
+        case "--project": info["project"] = next; i += 2; continue
+        case "--hook": break                     // legacy: `<kind> --hook` == `hook claude`
+        default: positional.append(a)
+        }
         i += 1
     }
-    if positional.count > 0 { info["title"] = positional[0] }
-    if positional.count > 1 { info["subtitle"] = positional[1] }
+
+    if cmd == "hook" || cliArgs.contains("--hook") {
+        let agent = cmd == "hook" ? (positional.first ?? "claude").lowercased() : "claude"
+        // most agents send JSON on stdin; Codex's legacy notify passes it as the last argument
+        var data = FileHandle.standardInput.readDataToEndOfFile()
+        if data.isEmpty, let last = cliArgs.last, last.hasPrefix("{") { data = Data(last.utf8) }
+        let json = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        guard let (kind, subtitle) = adapt(agent, json) else { exit(0) }
+        info["kind"] = kind
+        info["agent"] = agentNames[agent] ?? agent
+        if let sid = str(json, "session_id", "sessionId") { info["id"] = "\(agent):\(sid)" }
+        if let cwd = str(json, "cwd") { info["project"] = (cwd as NSString).lastPathComponent }
+        if let subtitle { info["subtitle"] = subtitle }
+    } else {
+        info["kind"] = cmd
+        if positional.count > 0, !positional[0].isEmpty { info["title"] = positional[0] }
+        if positional.count > 1, !positional[1].isEmpty { info["subtitle"] = positional[1] }
+        if let id = info["id"], let agent = info["agent"] { info["id"] = "\(agent.lowercased()):\(id)" }
+    }
 
     let env = ProcessInfo.processInfo.environment
-    if cliArgs.contains("--hook") {
-        let data = FileHandle.standardInput.readDataToEndOfFile()
-        let json = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
-        // Only Claude Code: other agents (Grok, etc.) reuse ~/.claude/settings.json hooks but
-        // send camelCase keys (hookEventName) instead of Claude's snake_case hook_event_name.
-        guard json["hook_event_name"] is String, json["hookEventName"] == nil else { exit(0) }
-        if let sid = json["session_id"] as? String { info["id"] = sid }
-        if let cwd = json["cwd"] as? String { info["project"] = (cwd as NSString).lastPathComponent }
-        if cmd == "input" {
-            let type = json["notification_type"] as? String ?? ""
-            let msg = json["message"] as? String ?? ""
-            // the 60s "still waiting" nudge after a finished task isn't a real question
-            if type == "idle_prompt" || msg.lowercased().contains("waiting for your input") { exit(0) }
-            if info["subtitle"] == nil, !msg.isEmpty { info["subtitle"] = msg }
-        }
-        if cmd == "done", info["subtitle"] == nil {
-            let text = (json["last_assistant_message"] as? String)
-                ?? (json["transcript_path"] as? String).flatMap(lastAssistantText)
-            if let t = text { info["subtitle"] = oneLine(t) }
-        }
-    }
-    if cmd != "clear", let ws = env["CMUX_WORKSPACE_ID"] {
+    if info["kind"] != "clear", let ws = env["CMUX_WORKSPACE_ID"] {
         info["workspace"] = ws
         if let s = env["CMUX_SURFACE_ID"] { info["surface"] = s }
         if let t = cmuxWorkspaceTitle(ws) { info["place"] = t }
@@ -417,7 +509,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let kind = Kind(rawValue: kindStr) else { return }
         let key = info["id"] ?? UUID().uuidString
         let place = info["place"] ?? info["project"]
-        let title = info["title"] ?? (place.map { "\(kind.label) · \($0)" } ?? kind.label)
+        let parts = [kind.label] + [info["agent"], place].compactMap { $0 }
+        let title = info["title"] ?? parts.joined(separator: " · ")
         let subtitle = info["subtitle"] ?? (kind == .done ? "All finished" : kind == .input ? "Waiting on you" : "")
 
         state.items.removeAll { $0.key == key }
